@@ -203,11 +203,11 @@ func (c *cacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Ve
 		new_version := versioner.Current()
 		if new_version == nil {
 			log.Debugln("version is no longer available; not caching the result.")
-			return result, err
+			return result, nil
 		}
 		if !bytes.Equal(new_version, version) {
 			log.Infoln("version has changed during execution; not caching the result.")
-			return result, err
+			return result, nil
 		}
 		file.Sem.Acquire(context.Background(), 3)
 		defer file.Sem.Release(3)
