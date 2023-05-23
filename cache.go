@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/nicois/file"
 	log "github.com/sirupsen/logrus"
 )
@@ -61,6 +62,7 @@ type Cacher interface {
 func Create(name string) Cacher {
 	usr, err := user.Current()
 	if err != nil {
+		sentry.CaptureException(err)
 		log.Fatal(err)
 	}
 	cacheDir := filepath.Join(usr.HomeDir, ".cache", name)
