@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
 	"time"
 
+	"github.com/getsentry/sentry-go"
+	"github.com/nicois/fastdb"
 	"github.com/nicois/file"
 	log "github.com/sirupsen/logrus"
 )
@@ -27,20 +28,35 @@ func (c *cacher) Invalidate(h hash.Hash, v Version) error {
 	}
 	version := v.Current()
 	cacheKey := h.Sum(version)
-	cacheFile := filepath.Join(c.cacheDir, "/.cache-"+hex.EncodeToString(cacheKey))
-	if err := os.Remove(cacheFile); err == nil {
+	hexCacheKey := hex.EncodeToString(cacheKey)
+	sql := "DELETE FROM cache WHERE key = ?"
+	if _, err := c.db.Writer().Exec(sql, hexCacheKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *cacher) Truncate() error {
+	sql := "DELETE FROM cache"
+	if _, err := c.db.Writer().Exec(sql); err != nil {
 		return err
 	}
 	return nil
 }
 
 type cacher struct {
-	cacheDir        string
-	maximumDuration time.Duration
+	db              fastdb.FastDB
+	defaultValidity time.Duration
 }
 
-func (c *cacher) SetMaximumDuration(d time.Duration) {
-	c.maximumDuration = d
+func (c *cacher) SetDefaultValidity(d time.Duration) {
+	c.defaultValidity = d
+}
+
+func (c *cacher) Close() {
+	if c.db != nil {
+		c.db.Close()
+	}
 }
 
 type mockCacher struct{}
@@ -50,81 +66,70 @@ func (m *mockCacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versione
 	return wrapped(os.Stdout, os.Stderr, make(chan []byte))
 }
 
-func (m *mockCacher) SetMaximumDuration(d time.Duration) {
+func (m *mockCacher) SetDefaultValidity(d time.Duration) {
+}
+
+func (m *mockCacher) Close() {
 }
 
 type Cacher interface {
 	Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Version) ([]byte, error)
-	SetMaximumDuration(d time.Duration)
+	SetDefaultValidity(d time.Duration)
+	Close()
 }
 
-func Create(name string) Cacher {
+func Create(ctx context.Context, name string) (*cacher, error) {
 	usr, err := user.Current()
 	if err != nil {
+		sentry.CaptureException(err)
 		log.Fatal(err)
 	}
-	cacheDir := filepath.Join(usr.HomeDir, ".cache", name)
+	cacheDir := filepath.Join(usr.HomeDir, ".cache")
+	return CreateInDirectory(ctx, name, cacheDir)
+}
+
+func CreateInDirectory(ctx context.Context, name string, cacheDir string) (*cacher, error) {
 	if !file.DirExists(cacheDir) {
 		err := os.MkdirAll(cacheDir, 0700)
 		if err != nil {
-			log.Errorf("%v cannot be used as a cache directory, so caching is disabled.", cacheDir)
-			return &mockCacher{}
+			return nil, err
 		}
 	}
-	result := &cacher{cacheDir: cacheDir, maximumDuration: time.Hour * 24}
-	go result.Cleanup()
-	return result
-}
-
-func (c *cacher) Cleanup() {
-	// delete cache files over a week old
-	now := time.Now()
-	filepath.WalkDir(c.cacheDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			log.Debugf("Not listening for changes in %v: not readable", path)
-			return nil
-		}
-		shouldRemove := false
-		if d.IsDir() {
-			if path != c.cacheDir {
-				// Do not remove a path unless it's empty and an hour old, to avoid
-				// situations where a file is being written there shortly.
-				isEmpty, err := file.DirIsEmpty(path)
-				if err != nil {
-					log.Infof("While trying to work out if %v is empty: %v", path, err)
-				}
-				if fileInfo, err := os.Stat(path); err == nil {
-					shouldRemove = fileInfo.ModTime().Add(time.Hour).Before(now)
-				}
-				if isEmpty && shouldRemove {
-					log.Debugf("%v is empty and over an hour old, so will remove it.", path)
-				}
-			}
-		} else {
-			if fileInfo, err := os.Stat(path); err == nil {
-				shouldRemove = fileInfo.ModTime().Add(time.Hour * 168).Before(now)
-
-				if shouldRemove {
-					log.Debugf("%v is over a week old, so deleting it.", path)
-				}
-			}
-		}
-		if shouldRemove {
-			err = os.Remove(path)
-			if err != nil {
-				log.Debugf("While trying to delete %v: %v", path, err)
-			}
-		}
-		return nil
-	})
-}
-
-func GetMtime(path string) (time.Time, error) {
-	fileinfo, err := os.Stat(path)
+	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%v.sqlite3", name))
+	db, err := fastdb.Open(cacheFile)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
-	return fileinfo.ModTime(), nil
+	sql := "CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value BLOB, stdout BLOB, stderr BLOB, expires INTEGER) STRICT;"
+	if _, err := db.Writer().Exec(sql); err != nil {
+		return nil, err
+	}
+	result := &cacher{db: db, defaultValidity: time.Hour * 24}
+	go result.cleanup(ctx)
+	return result, nil
+}
+
+// Purge outdated records
+func (c *cacher) cleanup(ctx context.Context) {
+	ticker := time.NewTicker(time.Hour)
+	sql := "DELETE FROM cache WHERE expires <= ?"
+	writer := c.db.Writer()
+
+	if _, err := writer.Exec(sql, time.Now().Unix()); err != nil {
+		// FIXME; log the error instead of panicing
+		log.Fatal(err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := writer.Exec(sql, time.Now().Unix()); err != nil {
+				// FIXME; log the error instead of panicing
+				log.Fatal(err)
+			}
+		}
+	}
 }
 
 func (c *cacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Version) ([]byte, error) {
@@ -132,8 +137,8 @@ func (c *cacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Ve
 			   hasher: provides a key for everything hashed by this
 		       versioner:(optional) supplies volatile caching key, which may change during execution.
 	*/
-	if c.maximumDuration <= time.Millisecond {
-		return []byte(""), fmt.Errorf("No maximum duration was configured")
+	if c.defaultValidity <= time.Millisecond {
+		return []byte(""), fmt.Errorf("No default validity was configured")
 	}
 	if versioner == nil {
 		versioner = Identity()
@@ -151,44 +156,32 @@ func (c *cacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Ve
 	}
 	cacheKey := hasher.Sum(version)
 	hexCacheKey := hex.EncodeToString(cacheKey)
-	// use a 2-layer deep caching structure, with 4096 entries maximum
-	// at the top layer.
-	intermediateHexSize := 4
-	subDir := filepath.Join(c.cacheDir, hexCacheKey[:intermediateHexSize])
-	cacheFile := filepath.Join(subDir, hexCacheKey[intermediateHexSize:]+"-cache")
-	stdoutFile := filepath.Join(subDir, hexCacheKey[intermediateHexSize:]+"-stdout")
-	stderrFile := filepath.Join(subDir, hexCacheKey[intermediateHexSize:]+"-stderr")
-	result, err := file.ReadBytes(cacheFile)
-	if err == nil {
-		// Is this file too old? If so, remove it (and stderr/stdout) and ignore
-		if mtime, err := GetMtime(cacheFile); err != nil || time.Now().Sub(mtime) > c.maximumDuration {
-			if err != nil {
-				log.Debugf("Removing cached %v as error: %v", cacheFile, err)
-			} else {
-				log.Debugf("Removing cached %v as it's too old: %v", cacheFile, time.Now().Sub(mtime))
-			}
-			os.Remove(cacheFile)
-			os.Remove(stdoutFile)
-			os.Remove(stderrFile)
-		}
-
-		stdout, err := file.ReadBytes(stdoutFile)
-		// stderr/stdout files may not exist. This probably means
-		// nothing was produced, so silently continue with the result.
-		if err == nil {
-			stderr, err := file.ReadBytes(stderrFile)
-			if err == nil {
-				os.Stdout.Write(stdout)
-				os.Stderr.Write(stderr)
-			}
-		}
-		// log.Debug("Using cached result.")
-		return result, nil
-	} else {
-		os.MkdirAll(subDir, 0o700)
+	sql := "SELECT value, stdout, stderr FROM cache WHERE key = ? AND ? < expires"
+	now := time.Now()
+	rows, err := c.db.Reader().Query(sql, hexCacheKey, now.Unix())
+	if err != nil {
+		return []byte(""), err
 	}
-	// couldn't read cached data for one reason or another
-	log.Debugln(err)
+	log.Debugln("bar")
+	defer rows.Close()
+	for rows.Next() {
+		var result []byte
+		var stdout []byte
+		var stderr []byte
+		if err := rows.Scan(&result, &stdout, &stderr); err != nil {
+			log.Debugln("could not parse the result")
+			return []byte(""), err
+		}
+		if len(stdout) > 0 {
+			os.Stdout.Write(stdout)
+		}
+		if len(stderr) > 0 {
+			os.Stderr.Write(stderr)
+		}
+		log.Debugf("found a valid result: %q", result)
+		return result, nil
+	}
+	log.Debugln("Found no valid results")
 
 	var stdout, stderr bytes.Buffer
 	log.Debugln("About to run the wrapped command")
@@ -197,44 +190,25 @@ func (c *cacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Ve
 	onChanged := make(chan []byte)
 	defer versioner.CancelNotifyOnChange(versioner.NotifyOnChange(version, onChanged))
 	result, resultError := wrapped(stdoutMw, stderrMw, onChanged)
+	sql = "INSERT INTO cache (key, value, stdout, stderr, expires) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, stdout=excluded.stdout, stderr=excluded.stderr, expires=excluded.expires;"
+	validUntil := now.Add(c.defaultValidity)
 	if resultError == nil {
 		new_version := versioner.Current()
 		if new_version == nil {
 			log.Debugln("version is no longer available; not caching the result.")
-			return result, err
+			return result, nil
 		}
 		if !bytes.Equal(new_version, version) {
 			log.Infoln("version has changed during execution; not caching the result.")
+			return result, nil
+		}
+		if _, err := c.db.Writer().Exec(sql, hexCacheKey, result, stdout.Bytes(), stderr.Bytes(), validUntil.Unix()); err != nil {
+			log.Error(err)
 			return result, err
 		}
-		file.Sem.Acquire(context.Background(), 3)
-		defer file.Sem.Release(3)
-		if handle, err := os.Create(cacheFile); err == nil {
-			if _, err := handle.Write(result); err == nil {
-				defer handle.Close()
-				stdoutBytes := stdout.Bytes()
-				stderrBytes := stderr.Bytes()
-				if len(stdoutBytes) > 0 || len(stderrBytes) > 0 {
-					if handle, err := os.Create(stdoutFile); err == nil {
-						defer handle.Close()
-						if _, err := handle.Write(stdout.Bytes()); err == nil {
-							if handle, err := os.Create(stderrFile); err == nil {
-								defer handle.Close()
-								if _, err := handle.Write(stderr.Bytes()); err == nil {
-								}
-							}
-						}
-					}
-				}
-			} else {
-				handle.Close()
-				os.Remove(cacheFile)
-				log.Debugf("Could not write cache: %v")
-				return []byte{}, err
-			}
-		}
+		log.Debugf("Cached the result with key %v until %v", hexCacheKey, validUntil)
 	} else {
-		log.Debugf("Not caching result as an error was returned: %v\n", resultError)
+		log.Debugf("Not caching result as an error was returned: %v", resultError)
 	}
 	return result, resultError
 }
