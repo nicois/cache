@@ -26,9 +26,11 @@ func WaitForCurrent(v Version) []byte {
 	return (<-c)
 }
 
-/* This type is used when you don't really care about being
-   notified on changes; it's sufficient to be able to get
-   the current value on demand.
+/*
+This type is used when you don't really care about being
+
+	notified on changes; it's sufficient to be able to get
+	the current value on demand.
 */
 type Reactive func() ([]byte, error)
 
@@ -68,7 +70,6 @@ func (r Reactive) NotifyOnChange(initial []byte, onChanged chan []byte) int {
 }
 
 func (r Reactive) CancelNotifyOnChange(i int) {
-	return
 }
 
 type hybrid struct {

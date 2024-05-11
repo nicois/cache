@@ -59,19 +59,6 @@ func (c *cacher) Close() {
 	}
 }
 
-type mockCacher struct{}
-
-func (m *mockCacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Version) ([]byte, error) {
-	// Same interface as the real cache, but doesn't ever cache
-	return wrapped(os.Stdout, os.Stderr, make(chan []byte))
-}
-
-func (m *mockCacher) SetDefaultValidity(d time.Duration) {
-}
-
-func (m *mockCacher) Close() {
-}
-
 type Cacher interface {
 	Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Version) ([]byte, error)
 	SetDefaultValidity(d time.Duration)
@@ -179,6 +166,7 @@ func (c *cacher) Cache(hasher hash.Hash, wrapped CacheableFunction, versioner Ve
 			os.Stderr.Write(stderr)
 		}
 		log.Debugf("found a valid result: %q", result)
+		//nolint:all // it is cleaner to handle the at-most-one-line case inside this scope
 		return result, nil
 	}
 	log.Debugln("Found no valid results")
