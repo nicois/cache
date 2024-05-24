@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,21 +23,24 @@ import (
 type (
 	// A CacheableFunction is provided with writers for any stdout/stderr they produce,
 	// along with a context which may be cancelled.
-	CacheableFunction func(ctx context.Context, stdout io.Writer, stderr io.Writer) (result []byte, err error)
+	CacheableFunction[valueT any]       func(ctx context.Context, stdout io.Writer, stderr io.Writer) (result valueT, err error)
+	SilentCacheableFunction[valueT any] func(ctx context.Context) (result valueT, err error)
 )
 
-type Cacher[T comparable] interface {
-	Cache(ctx context.Context, hasher hash.Hash, wrapped CacheableFunction, versioner Version[T]) ([]byte, error)
+type Cacher[valueT any, versionT comparable] interface {
+	Call(ctx context.Context, wrapped SilentCacheableFunction[valueT], version versionT) (valueT, error)
+	Cache(ctx context.Context, hasher hash.Hash, wrapped CacheableFunction[valueT], versioner Version[versionT]) (valueT, error)
 	SetDefaultValidity(d time.Duration)
 	Close()
 }
 
-type cacher[T comparable] struct {
+type cacher[valueT any, versionT comparable] struct {
 	db              fastdb.FastDB
 	defaultValidity time.Duration
+	nullValue       valueT
 }
 
-func (c *cacher[T]) Invalidate(h hash.Hash, v Version[T]) error {
+func (c *cacher[_, versionT]) Invalidate(h hash.Hash, v Version[versionT]) error {
 	if h == nil {
 		return fmt.Errorf("No hasher was provided")
 	}
@@ -58,7 +62,7 @@ func (c *cacher[T]) Invalidate(h hash.Hash, v Version[T]) error {
 	return nil
 }
 
-func (c *cacher[_]) Truncate() error {
+func (c *cacher[_, _]) Truncate() error {
 	sql := "DELETE FROM cache"
 	if _, err := c.db.Writer().Exec(sql); err != nil {
 		return err
@@ -66,27 +70,27 @@ func (c *cacher[_]) Truncate() error {
 	return nil
 }
 
-func (c *cacher[_]) SetDefaultValidity(d time.Duration) {
+func (c *cacher[_, _]) SetDefaultValidity(d time.Duration) {
 	c.defaultValidity = d
 }
 
-func (c *cacher[_]) Close() {
+func (c *cacher[_, _]) Close() {
 	if c.db != nil {
 		c.db.Close()
 	}
 }
 
-func Create[T comparable](ctx context.Context, name string) (*cacher[T], error) {
+func Create[valueT any, versionT comparable](ctx context.Context, name string) (*cacher[valueT, versionT], error) {
 	usr, err := user.Current()
 	if err != nil {
 		sentry.CaptureException(err)
 		log.Fatal(err)
 	}
 	cacheDir := filepath.Join(usr.HomeDir, ".cache")
-	return CreateInDirectory[T](ctx, name, cacheDir)
+	return CreateInDirectory[valueT, versionT](ctx, name, cacheDir)
 }
 
-func CreateInDirectory[T comparable](ctx context.Context, name string, cacheDir string) (*cacher[T], error) {
+func CreateInDirectory[valueT any, versionT comparable](ctx context.Context, name string, cacheDir string) (*cacher[valueT, versionT], error) {
 	if !file.DirExists(cacheDir) {
 		err := os.MkdirAll(cacheDir, 0700)
 		if err != nil {
@@ -102,13 +106,13 @@ func CreateInDirectory[T comparable](ctx context.Context, name string, cacheDir 
 	if _, err := db.Writer().Exec(sql); err != nil {
 		return nil, err
 	}
-	result := &cacher[T]{db: db, defaultValidity: time.Hour * 24}
+	result := &cacher[valueT, versionT]{db: db, defaultValidity: time.Hour * 24}
 	go result.cleanup(ctx)
 	return result, nil
 }
 
 // Purge outdated records
-func (c *cacher[_]) cleanup(ctx context.Context) {
+func (c *cacher[_, _]) cleanup(ctx context.Context) {
 	ticker := time.NewTicker(time.Hour)
 	sql := "DELETE FROM cache WHERE expires <= ?"
 	writer := c.db.Writer()
@@ -130,28 +134,35 @@ func (c *cacher[_]) cleanup(ctx context.Context) {
 	}
 }
 
-func (c *cacher[T]) Cache(ctx context.Context, hasher hash.Hash, wrapped CacheableFunction, versioner Version[T]) ([]byte, error) {
+/* Call is a simplified wrapper around Cache(), where you don't care about managing the hash and a dynamic version */
+func (c *cacher[valueT, versionT]) Call(ctx context.Context, wrapped SilentCacheableFunction[valueT], version versionT) (valueT, error) {
+	return c.Cache(ctx, sha256.New(), func(ctx context.Context, stdout io.Writer, stderr io.Writer) (result valueT, err error) {
+		return wrapped(ctx)
+	}, CreateStaticListener(version))
+}
+
+func (c *cacher[valueT, versionT]) Cache(ctx context.Context, hasher hash.Hash, wrapped CacheableFunction[valueT], versioner Version[versionT]) (valueT, error) {
 	/*
 			   hasher: provides a key for everything hashed by this
 		       versioner:(optional) supplies volatile caching key, which may change during execution.
 	*/
 	if versioner == nil {
-		return []byte(""), fmt.Errorf("Must supply a versioner")
+		return c.nullValue, fmt.Errorf("Must supply a versioner")
 	}
 	if c.defaultValidity <= time.Millisecond {
-		return []byte(""), fmt.Errorf("No default validity was configured")
+		return c.nullValue, fmt.Errorf("No default validity was configured")
 	}
 	if hasher == nil {
-		return []byte(""), fmt.Errorf("No hasher was provided")
+		return c.nullValue, fmt.Errorf("No hasher was provided")
 	}
 	versionB := []byte("---")
-	var version T
+	var version versionT
 	var err error
 	if versioner.HasCurrent() {
 		version = versioner.Current()
 		versionB, err = json.Marshal(version)
 		if err != nil {
-			return []byte(""), err
+			return c.nullValue, err
 		}
 	} else {
 		versioner = nil
@@ -162,17 +173,22 @@ func (c *cacher[T]) Cache(ctx context.Context, hasher hash.Hash, wrapped Cacheab
 	now := time.Now()
 	rows, err := c.db.Reader().Query(sql, hexCacheKey, now.Unix())
 	if err != nil {
-		return []byte(""), err
+		return c.nullValue, err
 	}
 	log.Debugln("bar")
 	defer rows.Close()
 	for rows.Next() {
-		var result []byte
+		var result valueT
+		var resultJ []byte
 		var stdout []byte
 		var stderr []byte
-		if err := rows.Scan(&result, &stdout, &stderr); err != nil {
+		if err := rows.Scan(&resultJ, &stdout, &stderr); err != nil {
 			log.Debugln("could not parse the result")
-			return []byte(""), err
+			return c.nullValue, err
+		}
+		err := json.Unmarshal(resultJ, &result)
+		if err != nil {
+			return result, err
 		}
 		if len(stdout) > 0 {
 			os.Stdout.Write(stdout)
@@ -180,7 +196,6 @@ func (c *cacher[T]) Cache(ctx context.Context, hasher hash.Hash, wrapped Cacheab
 		if len(stderr) > 0 {
 			os.Stderr.Write(stderr)
 		}
-		log.Debugf("found a valid result: %q", result)
 		//nolint:all // it is cleaner to handle the at-most-one-line case inside this scope
 		return result, nil
 	}
@@ -188,7 +203,7 @@ func (c *cacher[T]) Cache(ctx context.Context, hasher hash.Hash, wrapped Cacheab
 	select {
 	case <-ctx.Done():
 		log.Debugln("Context is cancelled, so not running the wrapped function")
-		return []byte(""), ctx.Err()
+		return c.nullValue, ctx.Err()
 	default:
 	}
 
@@ -196,7 +211,7 @@ func (c *cacher[T]) Cache(ctx context.Context, hasher hash.Hash, wrapped Cacheab
 	log.Debugln("About to run the wrapped command")
 	stdoutMw := io.MultiWriter(&stdout, os.Stdout)
 	stderrMw := io.MultiWriter(&stderr, os.Stderr)
-	onChange := make(chan T)
+	onChange := make(chan versionT)
 	if versioner != nil {
 		go func() {
 			// If the version changes, cancel the wrapped function (and self)
@@ -229,7 +244,11 @@ func (c *cacher[T]) Cache(ctx context.Context, hasher hash.Hash, wrapped Cacheab
 				log.Infoln("version has changed during execution; not caching the result.")
 				return result, nil
 			}
-			if _, err := c.db.Writer().Exec(sql, hexCacheKey, result, stdout.Bytes(), stderr.Bytes(), validUntil.Unix()); err != nil {
+			resultJ, err := json.Marshal(result)
+			if err != nil {
+				return result, err
+			}
+			if _, err := c.db.Writer().Exec(sql, hexCacheKey, resultJ, stdout.Bytes(), stderr.Bytes(), validUntil.Unix()); err != nil {
 				log.Error(err)
 				return result, err
 			}

@@ -11,6 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type testStructure struct {
+	foo string
+	bar int
+	baz []byte
+}
+
 func TestListener(t *testing.T) {
 	log.SetLevel(log.DebugLevel)
 	ctx := context.Background()
@@ -18,15 +24,15 @@ func TestListener(t *testing.T) {
 	// is terribly wrong
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	c, err := CreateInDirectory[string](ctx, "cache-test", t.TempDir())
+	c, err := CreateInDirectory[testStructure, string](ctx, "cache-test", t.TempDir())
 	require.NoError(t, err, "failed to create the cache")
 	hasher := sha256.New()
 	called := false
-	ok := func(ctx context.Context, stdout io.Writer, stderr io.Writer) (result []byte, err error) {
+	ok := func(ctx context.Context, stdout io.Writer, stderr io.Writer) (result testStructure, err error) {
 		called = true
 		stdout.Write([]byte("out"))
 		stderr.Write([]byte("err"))
-		return []byte("ok"), nil
+		return testStructure{foo: "hi", bar: 33, baz: []byte("um")}, nil
 	}
 
 	versionChannel := make(chan string, 1)
@@ -36,7 +42,7 @@ func TestListener(t *testing.T) {
 	// initially, meaning that the wrapper will not be cached
 	result, err := c.Cache(ctx, hasher, ok, versioner)
 	require.True(t, called)
-	require.Equal(t, result, []byte("ok"))
+	require.Equal(t, testStructure{foo: "hi", bar: 33, baz: []byte("um")}, result)
 	require.NoError(t, err)
 
 	// reset the called flag, then verify it is set
@@ -46,7 +52,7 @@ func TestListener(t *testing.T) {
 	result, err = c.Cache(ctx, hasher, ok, versioner)
 	require.False(t, versioner.HasCurrent())
 	require.True(t, called)
-	require.Equal(t, result, []byte("ok"))
+	require.Equal(t, testStructure{foo: "hi", bar: 33, baz: []byte("um")}, result)
 	require.NoError(t, err)
 
 	// When a version is sent, the current value will
@@ -59,7 +65,7 @@ func TestListener(t *testing.T) {
 	require.Equal(t, versioner.Current(), "v1")
 	result, err = c.Cache(ctx, hasher, ok, versioner)
 	require.NoError(t, err)
-	require.Equal(t, result, []byte("ok"))
+	require.Equal(t, testStructure{foo: "hi", bar: 33, baz: []byte("um")}, result)
 	require.True(t, called)
 
 	// If the version changes, this should cause the wrapped
@@ -71,7 +77,7 @@ func TestListener(t *testing.T) {
 	require.NoError(t, WaitForValue(ctx, versioner, "v2"))
 	result, err = c.Cache(ctx, hasher, ok, versioner)
 	require.NoError(t, err)
-	require.Equal(t, result, []byte("ok"))
+	require.Equal(t, testStructure{foo: "hi", bar: 33, baz: []byte("um")}, result)
 	require.True(t, called)
 
 	// now we'll cancel the context which should prevent the
@@ -83,7 +89,7 @@ func TestListener(t *testing.T) {
 	cancelCtx()
 	result, err = c.Cache(ctx, hasher, ok, versioner)
 	require.Error(t, err)
-	require.Equal(t, result, []byte(""))
+	require.Equal(t, testStructure{}, result)
 	require.False(t, called)
 }
 
@@ -92,7 +98,7 @@ func TestStaticListener(t *testing.T) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	c, err := CreateInDirectory[string](ctx, "cache-test", t.TempDir())
+	c, err := CreateInDirectory[[]byte, string](ctx, "cache-test", t.TempDir())
 	require.NoError(t, err, "failed to create the cache")
 	hasher := sha256.New()
 	called := false
@@ -139,7 +145,7 @@ func TestStaticListener(t *testing.T) {
 	cancelCtx()
 	result, err = c.Cache(ctx, hasher, ok, versioner)
 	require.Error(t, err)
-	require.Equal(t, result, []byte(""))
+	require.Equal(t, result, []byte(nil))
 	require.False(t, called)
 }
 
@@ -148,7 +154,7 @@ func TestReactiveListener(t *testing.T) {
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	c, err := CreateInDirectory[string](ctx, "cache-test", t.TempDir())
+	c, err := CreateInDirectory[[]byte, string](ctx, "cache-test", t.TempDir())
 	require.NoError(t, err, "failed to create the cache")
 	hasher := sha256.New()
 	called := false
